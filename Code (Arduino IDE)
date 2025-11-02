@@ -1,0 +1,127 @@
+#define F_CPU 16000000UL
+#include <avr/io.h>
+#include <util/delay.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <stdint.h>
+
+// ================== Pin Map ==================
+#define MQ_CH       0
+#define TRIG_PIN    PB0
+#define ECHO_PIN    PB1
+#define LED_G       PC3    // A3
+#define LED_B       PC2    // A2
+#define LED_R       PC1    // A1
+#define SERVO_PIN   PD6    // OC0A PWM
+
+// ================== UART (for Serial Monitor) ==================
+void uart_init(unsigned int ubrr) {
+  UBRR0H = (unsigned char)(ubrr >> 8);
+  UBRR0L = (unsigned char)ubrr;
+  UCSR0B = (1 << TXEN0);        // enable transmitter
+  UCSR0C = (1 << UCSZ01) | (1 << UCSZ00); // 8-bit data
+}
+
+void uart_transmit(char data) {
+  while (!(UCSR0A & (1 << UDRE0)));
+  UDR0 = data;
+}
+
+void uart_print(const char *s) {
+  while (*s) uart_transmit(*s++);
+}
+
+// ================== ADC (MQ2) ==================
+void adc_init(void) {
+  ADMUX = (1 << REFS0);
+  ADCSRA = (1 << ADEN) | (1 << ADPS2) | (1 << ADPS1) | (1 << ADPS0);
+}
+
+uint16_t adc_read(uint8_t ch) {
+  ADMUX = (ADMUX & 0xF8) | (ch & 0x07);
+  ADCSRA |= (1 << ADSC);
+  while (ADCSRA & (1 << ADSC));
+  return ADC;
+}
+
+// ================== Ultrasonic ==================
+void us_init(void) {
+  DDRB |= (1 << TRIG_PIN);
+  DDRB &= ~(1 << ECHO_PIN);
+}
+
+uint16_t us_dist(void) {
+  PORTB &= ~(1 << TRIG_PIN); 
+  _delay_us(2);
+  PORTB |= (1 << TRIG_PIN); 
+  _delay_us(10); 
+  PORTB &= ~(1 << TRIG_PIN);
+
+  uint32_t c = 0;
+  while (!(PINB & (1 << ECHO_PIN))) {
+    if (++c > 60000) return 999;
+    _delay_us(1);
+  }
+
+  c = 0;
+  while (PINB & (1 << ECHO_PIN)) {
+    if (++c > 60000) break;
+    _delay_us(1);
+  }
+
+  return (uint16_t)(c / 58); // distance in cm
+}
+
+// ================== Servo (Timer0 PWM) ==================
+void servo_init(void) {
+  DDRD |= (1 << SERVO_PIN);
+  TCCR0A = (1 << COM0A1) | (1 << WGM01) | (1 << WGM00);
+  TCCR0B = (1 << CS01) | (1 << CS00); // prescaler 64
+}
+
+void servo_angle(uint8_t angle) {
+  // Map 0–180° roughly to 1–2 ms PWM
+  OCR0A = 15 + (angle * 2 / 25); 
+}
+
+// ================== Main ==================
+int main(void) {
+  uart_init(103);   // 9600 baud
+  adc_init();
+  us_init();
+  servo_init();
+
+  DDRC |= (1 << LED_G) | (1 << LED_B) | (1 << LED_R); // LEDs as outputs
+
+  uart_print("Drone Safety System Ready...\r\n");
+
+  while (1) {
+    uint16_t gas = adc_read(MQ_CH);
+    uint16_t dist = us_dist();
+
+    char buffer[60];
+    snprintf(buffer, sizeof(buffer), "Gas: %u | Dist: %u cm\r\n", gas, dist);
+    uart_print(buffer);
+
+    uint8_t state = 0;
+    if (gas > 350 || dist < 20) state = 1;     // warning
+    if (gas > 500 || dist < 10) state = 2;     // critical
+
+    // LED + Servo response
+    if (state == 0) {
+      PORTC = (1 << LED_G);     // Green = Normal
+      servo_angle(90);
+      uart_print("Status: NORMAL\r\n");
+    } else if (state == 1) {
+      PORTC = (1 << LED_B);     // Blue = Warning
+      servo_angle(120);
+      uart_print("Status: WARNING\r\n");
+    } else {
+      PORTC = (1 << LED_R);     // Red = Critical
+      servo_angle(180);
+      uart_print("Status: CRITICAL\r\n");
+    }
+
+    _delay_ms(1000);
+  }
+}
